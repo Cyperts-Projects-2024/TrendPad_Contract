@@ -12,7 +12,7 @@ import "./IUniswapV2Factory.sol";
 import "./ITrendLock.sol";
 
 
-contract IDOPool is Ownable, ReentrancyGuard {
+contract TrendPool is Ownable, ReentrancyGuard {
     using SafeMath for uint256;
     using SafeERC20 for ERC20;
     

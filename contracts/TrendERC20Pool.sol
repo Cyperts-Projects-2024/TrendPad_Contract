@@ -10,7 +10,7 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "./IUniswapV2Router02.sol";
 import "./IUniswapV2Factory.sol";
 import "./ITrendLock.sol";
-contract IDOERC20Pool is Ownable, ReentrancyGuard {
+contract TrendERC20Pool is Ownable, ReentrancyGuard {
     using SafeMath for uint256;
     using SafeERC20 for ERC20;
 
