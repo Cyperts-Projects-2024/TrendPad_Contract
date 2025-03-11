@@ -85,7 +85,7 @@ contract TrendERC20Pool is Ownable, ReentrancyGuard {
         bool _burnType,
         address _feeWallet,
         uint _feeAmount
-    ) Ownable(msg.sender){
+    ) {
         rewardToken = _rewardToken;
         decimals = rewardToken.decimals();
         locker = ITrendLock(_locker);

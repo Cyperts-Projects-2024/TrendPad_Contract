@@ -171,7 +171,7 @@ contract Fairlaunch is Ownable, ReentrancyGuard {
         uint256 balance = address(this).balance;
         require(balance>0,'Not Enough Funds in Pool');
 
-        //  if ( saleInfo.lpPayPercent > 0) {
+         if ( saleInfo.lpPayPercent > 0) {
           
             uint256 ethForLP = (balance * saleInfo.lpPayPercent)/100;
             uint256 ethWithdraw = balance - ethForLP;
@@ -213,10 +213,10 @@ contract Fairlaunch is Ownable, ReentrancyGuard {
             // Withdraw  restETH
             // (bool success ) = msg.sender.call{value: ethWithdraw}("");
             // require(success, "Transfer failed.");
-        // } else {
+        } else {
             (bool success, ) = msg.sender.call{value: balance}("");
             require(success, "Transfer failed.");
-        // }
+        }
         distributed = true;
     }
 
@@ -236,11 +236,11 @@ contract Fairlaunch is Ownable, ReentrancyGuard {
         emit PoolCancelled(block.timestamp);
 }
 
-   function getFairLaunchTokenAmount(
+  function getFairLaunchTokenAmount(
     uint256 _amount, 
     uint lpPercent, 
     uint256 _decimals
-)   public view returns (uint256) {
+) public view returns (uint256) {
     uint256 _ethAmount = 1 ether; // 1 ETH in wei
     uint256 fee = (_ethAmount * feePercent) / 100; // Calculate fee
     uint256 adjustedEthAmount = _ethAmount - fee; // Adjust ETH amount after fee
@@ -250,9 +250,7 @@ contract Fairlaunch is Ownable, ReentrancyGuard {
 }
   }
   
-// [800000000000000000000,100000000000000000,400000000000000000,100000000000000000,300000000000000000,500000000000000000000,51]
-//  // [1000000000000000000000,100000000000000000,0,51]
-//  [17352811046,17352811146,1735281946]
+// [1000000000000000000000,100000000000000000,0,51]
+// [1734494244,1734494344,1734494444]
 // 0xdD870fA1b7C4700F2BD7f44238821C26f7392148
 // 4
-// 0x57763c673527745678883f0564A4df9fC0C2d343    locking contract

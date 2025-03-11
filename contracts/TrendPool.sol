@@ -86,7 +86,7 @@ contract TrendPool is Ownable, ReentrancyGuard {
         bool _burnType,
         address _feeWallet,
         uint _feeAmount
-            )Ownable(msg.sender) {
+            ) {
 
         rewardToken = _rewardToken;
         decimals = rewardToken.decimals();
@@ -218,49 +218,50 @@ contract TrendPool is Ownable, ReentrancyGuard {
 
         uint256 balance = address(this).balance;
         require(balance>0,'Not Enough Funds in Pool');
-        if ( saleInfo.lpInterestRate > 0 && saleInfo.listingPrice > 0 ) {
+        // if ( saleInfo.lpInterestRate > 0 && saleInfo.listingPrice > 0 ) {
           
-            uint256 ethForLP = (balance * saleInfo.lpInterestRate)/100;
-            uint256 ethWithdraw = balance - ethForLP;
+        //     uint256 ethForLP = (balance * saleInfo.lpInterestRate)/100;
+        //     uint256 ethWithdraw = balance - ethForLP;
 
-            uint256 tokenAmount = getTokenAmount(ethForLP, saleInfo.listingPrice);
+        //     uint256 tokenAmount = getTokenAmount(ethForLP, saleInfo.listingPrice);
 
-            // Add Liquidity ETH
-            IUniswapV2Router02 uniswapRouter = IUniswapV2Router02(dexInfo.router);
-            rewardToken.approve(address(uniswapRouter), tokenAmount);
-            (,, uint liquidity) = uniswapRouter.addLiquidityETH{value: ethForLP}(
-                address(rewardToken),
-                tokenAmount,
-                0, // slippage is unavoidable
-                0, // slippage is unavoidable
-                address(this),
-                block.timestamp + 360
-            );
+        //     // Add Liquidity ETH
+        //     IUniswapV2Router02 uniswapRouter = IUniswapV2Router02(dexInfo.router);
+        //     rewardToken.approve(address(uniswapRouter), tokenAmount);
+        //     (,, uint liquidity) = uniswapRouter.addLiquidityETH{value: ethForLP}(
+        //         address(rewardToken),
+        //         tokenAmount,
+        //         0, // slippage is unavoidable
+        //         0, // slippage is unavoidable
+        //         address(this),
+        //         block.timestamp + 360
+        //     );
 
-            // Lock LP Tokens
-            (address lpTokenAddress) = IUniswapV2Factory(dexInfo.factory).getPair(address(rewardToken), dexInfo.weth);
+        //     // Lock LP Tokens
+        //     (address lpTokenAddress) = IUniswapV2Factory(dexInfo.factory).getPair(address(rewardToken), dexInfo.weth);
 
-            ERC20 lpToken = ERC20(lpTokenAddress);
+        //     ERC20 lpToken = ERC20(lpTokenAddress);
 
-            if (timestamps.unlockTimestamp > block.timestamp) {
-                lpToken.approve(address(locker), liquidity);
-                locker.lock(
-                    msg.sender,
-                    lpTokenAddress,
-                    true,
-                    liquidity,
-                    timestamps.unlockTimestamp,
-                    string.concat(lpToken.symbol(), " tokens locker")
-                );
-            }
+        //     if (timestamps.unlockTimestamp > block.timestamp) {
+        //         lpToken.approve(address(locker), liquidity);
+        //         locker.lock(
+        //             msg.sender,
+        //             lpTokenAddress,
+        //             true,
+        //             liquidity,
+        //             timestamps.unlockTimestamp,
+        //             string.concat(lpToken.symbol(), " tokens locker")
+        //         );
+        //     }
 
-            // Withdraw rest ETH
-            (bool success, ) = msg.sender.call{value: ethWithdraw}("");
-            require(success, "Transfer failed.");
-        } else {
+        //     // Withdraw rest ETH
+        //     (bool success, ) = msg.sender.call{value: ethWithdraw}("");
+        //     require(success, "Transfer failed.");
+        // } 
+        // else 
             (bool success, ) = msg.sender.call{value: balance}("");
             require(success, "Transfer failed.");
-        }
+        // }
 
         distributed = true;
     }
@@ -314,3 +315,13 @@ contract TrendPool is Ownable, ReentrancyGuard {
 }
 
 // Withdraw Cancelled Tokens making this name Function well soon
+
+
+// [800000000000000000000,100000000000000000,400000000000000000,100000000000000000,300000000000000000,500000000000000000000,51]
+// [1735282727,1735282827,1735282927]
+// 0xdD870fA1b7C4700F2BD7f44238821C26f7392148
+// 4
+// 0x57763c673527745678883f0564A4df9fC0C2d343    locking contract
+
+// [1000000000000000000000,100000000000000000,0,51]
+// 0xdD870fA1b7C4700F2BD7f44238821C26f7392148

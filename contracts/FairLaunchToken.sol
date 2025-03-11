@@ -79,7 +79,7 @@ contract FairLaunchToken is Ownable,ReentrancyGuard{
     string memory _metaDataURL,
     address _feeWallet,
     uint _feePercent
-     )Ownable(msg.sender){
+     ){
      saleToken=_saleToken;
      saleTokenDecimals=_saleToken.decimals();
      payToken=_payToken;

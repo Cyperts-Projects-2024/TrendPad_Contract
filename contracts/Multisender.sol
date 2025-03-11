@@ -13,7 +13,7 @@ import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 
     }
 
-constructor()Ownable(msg.sender){
+constructor(){
 
 }
 
