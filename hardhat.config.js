@@ -42,7 +42,7 @@ module.exports = {
       // Adjust to the correct chain ID for the testnet
       accounts: [
         process.env.PRIVATE_KEY ||
-        "6df6f949962d16815e3b5f9c420d451f894eea3b752ddcd836f612c7c83a21db",
+        "",
       ],
     },
 
