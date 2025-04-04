@@ -1,62 +1,118 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.4;
+
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
- contract Multisender is Ownable{
-    using SafeMath for uint256;
-    using SafeMath for uint16;
+interface ITrendMultisend {
+    function multisendToken(
+        address token,
+        bool ensureExactAmount,
+        address[] calldata targets,
+        uint256[] calldata amounts
+    ) external payable;
 
-    uint16 public recipentLimit;
-    receive() external payable {
-
-    }
-
-constructor(){
-
+    function multisendEther(
+        address[] calldata targets,
+        uint256[] calldata amounts
+    ) external payable;
 }
 
-    function SandEthEqaully (address payable [] calldata _address) external payable {
-        uint16 length=uint16(_address.length);
-        uint256 value=msg.value.div(length);
-        for (uint16 i;i<length;++i){
-            _address[i].transfer(value);
+contract TrendMultisend is Ownable, ITrendMultisend {
+    using SafeERC20 for IERC20;
+
+    event Multisent(address token, uint256 total);
+
+    receive() external payable {
+        revert();
+    }
+
+    function multisendToken(
+        address token,
+        bool ensureExactAmount,
+        address[] calldata targets,
+        uint256[] calldata amounts
+    ) external payable override {
+        if (token == address(0)) {
+            multisendEther(targets, amounts);
+        } else {
+            require(targets.length == amounts.length, "Length mismatched");
+            IERC20 erc20 = IERC20(token);
+            uint256 total = 0;
+
+            // In case people want to make sure they transfer the exact
+            // amount of tokens to the recipients (for example, an owner
+            // might forget excluding this contract from the transfer fee
+            // deduction), use this option as a safeguard
+            function(
+                IERC20,
+                address,
+                address,
+                uint256
+            ) transfer = ensureExactAmount
+                    ? _safeTransferFromEnsureExactAmount
+                    : _safeTransferFrom;
+
+            for (uint256 i = 0; i < targets.length; i++) {
+                total += amounts[i];
+                transfer(erc20, msg.sender, targets[i], amounts[i]);
+            }
+
+            emit Multisent(token, total);
         }
     }
 
-      function SendEthByValue (address payable [] calldata _address,uint256 [] calldata values ) external payable {
-        uint16 length=uint16(_address.length);
-        for (uint16 i;i<length;++i){
-            _address[i].transfer(values[i]);
+    function multisendEther(
+        address[] calldata targets,
+        uint256[] calldata amounts
+    ) public payable override {
+        require(targets.length == amounts.length, "Length mismatched");
+
+        uint256 total;
+        for (uint256 i = 0; i < targets.length; i++) {
+            total += amounts[i];
+            payable(targets[i]).transfer(amounts[i]);
         }
+
+        // In case someone tries to claim the ether inside the contract
+        // by sending a higher sum of total amount than msg.value
+        require(total == msg.value, "Total mismatched");
+
+        emit Multisent(address(0), total);
     }
 
-    function SandTokenEqaully (address _tokenAddress,address payable [] calldata _address, uint256 _amount) external  {
-        uint16 length=uint16(_address.length);
-        uint256 value=_amount.div(length);
-        IERC20 tokenAddress=IERC20(_tokenAddress);
-        for (uint16 i;i<length;++i){
-            tokenAddress.transferFrom(msg.sender,_address[i],value);
-        }
+    function withdrawWronglySentEther(address to) external onlyOwner {
+        payable(to).transfer(address(this).balance);
     }
-     
-     function SendTokenByValue (address _tokenAddress , address payable [] calldata _address,uint256 [] calldata values) external payable {
-        uint16 length=uint16(_address.length);
-        IERC20 tokenAddress=IERC20(_tokenAddress);
-        for (uint16 i;i<length;++i){
-            tokenAddress.transferFrom(msg.sender,_address[i],values[i]);
-        }
-    }
- //withdraw
-    function withdraw(address payable  _address,uint256 _value) external onlyOwner{
-        _address.transfer(_value);
-    }
-// withdraw 
-   function withdrawTokens(address _tokenAddress,address _address, uint256 _value) external  onlyOwner{
-    IERC20(_tokenAddress).transfer(_address,_value);
-   }
 
- }
-//  0x4B20993Bc481177ec7E8f571ceCaE8A9e22C02db
-// 0x78731D3Ca6b7E34aC0F824c42a7cC18A495cabaB
+    function withdrawWronglySentToken(address token, address to)
+        external
+        onlyOwner
+    {
+        IERC20(token).safeTransfer(to, IERC20(token).balanceOf(address(this)));
+    }
+
+    function _safeTransferFromEnsureExactAmount(
+        IERC20 token,
+        address from,
+        address to,
+        uint256 amount
+    ) private {
+        uint256 balanceBefore = token.balanceOf(to);
+        token.safeTransferFrom(from, to, amount);
+        require(
+            token.balanceOf(to) - balanceBefore == (from != to ? amount : 0), // if from is the same as to, the final balance should be the same as before the transfer
+            "Not enough tokens were transfered, check tax and fee options or try setting ensureExactAmount to false"
+        );
+    }
+
+    function _safeTransferFrom(
+        IERC20 token,
+        address from,
+        address to,
+        uint256 amount
+    ) private {
+        token.safeTransferFrom(from, to, amount);
+    }
+}

@@ -32,7 +32,7 @@ module.exports = {
       chainId: 31337, // Default chain ID for Hardhat
       // Optional settings for Hardhat network
       allowUnlimitedContractSize: true, // Useful for debugging large contracts
-      blockGasLimit: 12000000, // Set higher gas limit if needed
+      blockGasLimit: 30000, // Set higher gas limit if needed
     },
     testnet: {
       url: process.env.TESTNET_RPC || "https://data-seed-prebsc-2-s1.binance.org:8545/", // Use environment variable or fallback to localhost
