@@ -1,4 +1,4 @@
-const { ethers } = require("hardhat");
+const { ethers, upgrades } = require("hardhat");
 
 async function main() {
 const TrendPool = await ethers.getContractFactory("TrendFairlaunchPoolV2");
@@ -6,8 +6,9 @@ const signer = (await ethers.getSigners())[0];
 const nonce = await signer.getNonce();
   // Deploy the contract
   const token = await TrendPool.deploy({
+    initializer: false,
     nonce,
-    gasPrice: ethers.parseUnits("30", "gwei")
+    gasPrice: ethers.parseUnits("40", "gwei"),
   });
    
   await token.waitForDeployment();  

@@ -1,347 +1,782 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "./IUniswapV2Router02.sol";
 import "./IUniswapV2Factory.sol";
-import "./ITrendLock.sol";
-contract TrendERC20Pool is Ownable, ReentrancyGuard {
-    using SafeMath for uint256;
-    using SafeERC20 for ERC20;
+import "./IUniswapV2Pair.sol";
 
+
+interface ITrendLock {
+    function lock(
+        address _withdrawer,
+        address _token,
+        bool _isLpToken,
+        uint256 _amount,
+        uint256 _unlockTimestamp,
+        string calldata _description
+    ) external;
+}
+contract TrendERC20PoolV2 is Initializable,OwnableUpgradeable, ReentrancyGuardUpgradeable {
+    using SafeERC20 for ERC20;
+    
+        // --------------------------------------------------------------------------------
+        // Structures
+        // --------------------------------------------------------------------------------
     struct SaleInfo {
-        uint256 tokenPrice; // one token in erc20pay WEI
-        uint256 softCap;
-        uint256 hardCap;
-        uint256 minPayment;
-        uint256 maxPayment;
-        uint256 listingPrice; // one token in WEI
-        uint256 lpInterestRate;
-    }
+        address Currency; 
+        address rewardToken;
+        uint256 presaleToken;
+        uint256 liquidityToken;
+        uint256 tokenPrice;    // Price per token in WEI
+        uint256 softCap;       // Min ETH required
+        uint256 hardCap;       // Max ETH raised
+        uint256 minEthPayment; // Min contribution
+        uint256 maxEthPayment; // Max contribution
+        uint256 listingPrice;  // (Optional) listing price in WEI
+        uint256 lpInterestRate;// (Optional) % of raised ETH for LP
+        bool  burnType;
+        bool affiliation; 
+        bool isEnableWhiteList ;    // (Unused flag; we do actual affiliate logic below)
+        bool isVestingEnabled;
+}
+
 
     struct Timestamps {
-        uint256 startTimestamp;
-        uint256 endTimestamp;
-        uint256 unlockTimestamp;
-    }
-
+            uint256 startTimestamp;  
+            uint256 endTimestamp;    
+            uint256 claimTimestamp;  
+            uint256 unlockTime; 
+        }
     struct DEXInfo {
-        address router;
-        address factory;
-        address weth;
-    }
+            address router;
+            address factory;
+            address weth;
+        }
 
     struct UserInfo {
-        uint debt;
-        uint total;
-        uint totalInvested;
+            uint256 debt;            
+            uint256 claimed;           
+            uint256 totalInvested;
+            bool isRefunded; // Used to track if user has withdrawn their contribution
+        }
+
+
+    struct AffiliateInfo {             
+        uint8 poolRefCount;            // Total number of users referred
+        uint8 realTimeRewardPercentage;// Current reward % based on referrals
+        uint256 currentReward;           // Current reward user can claim
+        uint256 maxReward;               // Max reward user can earn
+        uint256 totalReferredAmount; // Total amount referred by user
+        uint256 totalRewardAmount;    
     }
-    ERC20 public rewardToken;
-    uint256 public decimals;
-    string public metadataURL;
+
+    struct VestingInfo {
+            uint8 TGEPercent;
+            uint256 cycleTime;
+            uint8 releasePercent;
+            uint256 startTime;
+    }
+
+    // --------------------------------------------------------------------------------
+    // Public state
+    // --------------------------------------------------------------------------------
+
+    uint8 public decimals;
+    uint8 public currencyDecimals;
     address public feeWallet;
-    uint public feePercent;
-    bool public burnType = false;
-    bool public isPoolCancel;
-
-    ERC20 public payToken;
-    uint256 public payTokenDecimals;
-
+    uint8 public feePercent;
+    bool public isPoolCancelled;
     SaleInfo public saleInfo;
     Timestamps public timestamps;
     DEXInfo public dexInfo;
-
+    VestingInfo public vestingInfo;
+    AffiliateInfo public affiliateInfo;
     ITrendLock public locker;
-
     uint256 public totalInvested;
     uint256 public tokensForDistribution;
     uint256 public distributedTokens;
-
+    uint256 totalRefundedCount;
     bool public distributed = false;
 
+
+    enum SaleStatus {
+        Cancelled,
+        Upcoming,
+        Live,
+        Filled,
+        Ended
+    }
+
+    mapping(address => bool) public whitelistedAddresses;
+    address[] public participants;
+    address[] public sponeserAddress;
+    address[] public whitelistList;
     mapping(address => UserInfo) public userInfo;
-
-    event TokensDebt(
-        address indexed holder,
-        uint256 payAmount,
-        uint256 tokenAmount
+    mapping(address => uint256) public sponsorReferralSum;
+    mapping (address=>uint256) public  sponserReward;
+    mapping(address => bool) public sponsorClaimed;
+    // --------------------------------------------------------------------------------
+    // Events
+    // --------------------------------------------------------------------------------
+        event TokensDebt(address indexed holder, uint256 ethAmount, uint256 tokenAmount);
+        event PoolCancelled(uint256 timestamp);
+        event TimestampsUpdated(uint256 startTimestamp, uint256 endTimestamp);
+        event WhitelistUpdated(address indexed user, bool status);
+        // Affiliate-specific events
+        event SponsorSet(address indexed user, address indexed sponsor);
+        event SponsorRewardClaimed(address indexed sponsor, uint256 amount);
+        event ContributionRefunded(address indexed user, uint256 amount);
+        event PoolFinalized(address indexed pool, uint256 timestamp);
+        event TokensRefunded(address indexed user, uint256 amount);
+        event SaleTypeChanged(bool status);
+        event AffiliateUpdated(bool enabled, uint8 rate);
+        event claimTimeUpdated(uint256 claimTimestamp);
+        event VestingUpdated(
+        uint8 TGEPercent,
+        uint256 cycleTime,
+        uint8 releasePercent,
+        uint256 startTime
     );
+    // --------------------------------------------------------------------------------
+    // Initialization
+    // --------------------------------------------------------------------------------
 
-    event TokensWithdrawn(address indexed holder, uint256 amount);
+        function initialize(
+            SaleInfo memory _saleInfo,
+            Timestamps memory _timestamps,
+            DEXInfo memory _dexInfo,
+            address _locker,
+            address _feeWallet,
+            uint8 _feePercent
+        ) public initializer {
+            __Ownable_init(msg.sender);
+            __ReentrancyGuard_init();
 
-    constructor(
-        ERC20 _rewardToken,
-        ERC20 _payToken,
-        SaleInfo memory _finInfo,
-        Timestamps memory _timestamps,
-        DEXInfo memory _dexInfo,
-        address _locker,
-        string memory _metadataURL,
-        bool _burnType,
-        address _feeWallet,
-        uint _feeAmount
-    ) {
-        rewardToken = _rewardToken;
-        decimals = rewardToken.decimals();
-        locker = ITrendLock(_locker);
-        payToken = _payToken;
-        payTokenDecimals = payToken.decimals();
-        burnType = _burnType;
-        feeWallet = _feeWallet;
-        feePercent = _feeAmount;
-        saleInfo = _finInfo;
-        setTimestamps(_timestamps);
-        dexInfo = _dexInfo;
-        setMetadataURL(_metadataURL);
+            saleInfo = _saleInfo;
+            timestamps = _timestamps;
+            dexInfo = _dexInfo;
+            locker = ITrendLock(_locker);
+            feeWallet = _feeWallet;
+            feePercent = _feePercent;
+            decimals = ERC20(saleInfo.Currency).decimals();
+            currencyDecimals = ERC20(saleInfo.Currency).decimals();
     }
 
-    function setTimestamps(Timestamps memory _timestamps) internal {
-        require(
-            _timestamps.startTimestamp < _timestamps.endTimestamp,
-            "Start timestamp must be less than finish timestamp"
-        );
-        require(
-            _timestamps.endTimestamp > block.timestamp,
-            "Finish timestamp must be more than current block"
-        );
+     // --------------------------------------------------------------------------------
+     // Public user functions
+     // --------------------------------------------------------------------------------
+    
+    function contribute(address _sponsor,uint256 _amount) external nonReentrant {
+            require(getSaleStatus() == SaleStatus.Live, "Sale Is Not active");
+            require(_amount >= saleInfo.minEthPayment||_amount==(saleInfo.hardCap - totalInvested), "Below min");
+            require(_amount <= saleInfo.maxEthPayment, "contribution  Above maxAmount");
+            require(totalInvested + _amount <= saleInfo.hardCap, "Over hard cap");
+            // Whitelist check
+            if (saleInfo.isEnableWhiteList) {
+                require(whitelistedAddresses[msg.sender], "Your Not whitelisted");
+            }
 
-        timestamps = _timestamps;
+            ERC20(saleInfo.Currency).safeTransferFrom(msg.sender, address(this), _amount);
+
+            // Update user info
+            UserInfo storage user = userInfo[msg.sender];
+            require(user.totalInvested + _amount <= saleInfo.maxEthPayment, "Exceed personal max");
+            user.totalInvested += _amount;
+            // Calculate tokens owed
+            uint256 tokenAmount = _getTokenAmount(_amount, saleInfo.tokenPrice);
+            user.debt  += tokenAmount;
+            // Update global totals
+            totalInvested      += _amount;
+            tokensForDistribution += tokenAmount;
+            // track participants if first time
+            if (user.totalInvested == _amount) {
+                participants.push(msg.sender);
+            }
+            
+            // -------------------------
+            // Affiliate logic
+            // -------------------------
+            if (saleInfo.affiliation) {
+            _handleAffiliate(_sponsor, _amount);
+
+
+    }
+            emit TokensDebt(msg.sender, _amount, tokenAmount);
+}
+
+    
+    function claimSponsorReward() external nonReentrant { //make one read function  for Amount 
+            require(saleInfo.affiliation, "Affiliate disabled");
+            require(distributed,"Pool not finalized");
+            require(!sponsorClaimed[msg.sender], "Already claimed");
+            require(sponserReward[msg.sender]>0,"Nothing to claim");   
+            uint256 reward =(sponserReward[msg.sender])-(sponserReward[msg.sender]*feePercent)/100;
+            sponsorClaimed[msg.sender]=true;
+            ERC20(saleInfo.Currency).safeTransfer(msg.sender, reward);
+            emit SponsorRewardClaimed(msg.sender,reward);
     }
 
-    function setMetadataURL(string memory _metadataURL) public {
-        metadataURL = _metadataURL;
-    }
-
-    function pay(uint256 amount) external {
-        require(block.timestamp >= timestamps.startTimestamp, "Not started");
-        require(block.timestamp < timestamps.endTimestamp, "Ended");
-
-        require(amount >= saleInfo.minPayment, "Less then min amount");
-        require(amount <= saleInfo.maxPayment, "More then max amount");
-        require(totalInvested.add(amount) <= saleInfo.hardCap, "Overfilled");
-
-        UserInfo storage user = userInfo[msg.sender];
-        require(
-            user.totalInvested.add(amount) <= saleInfo.maxPayment,
-            "More then max amount"
-        );
-        // @to-do - check allowance
-
-        uint256 tokenAmount = getTokenAmount(amount, saleInfo.tokenPrice);
-
-        payToken.safeTransferFrom(msg.sender, address(this), amount);
-
-        totalInvested = totalInvested.add(amount);
-        tokensForDistribution = tokensForDistribution.add(tokenAmount);
-        user.totalInvested = user.totalInvested.add(amount);
-        user.total = user.total.add(tokenAmount);
-        user.debt = user.debt.add(tokenAmount);
-
-        emit TokensDebt(msg.sender, amount, tokenAmount);
-    }
-
-    function refund() external {
-        require(
-            block.timestamp > timestamps.endTimestamp,
-            "The IDO pool has not ended."
-        );
-        require(
-            totalInvested < saleInfo.softCap,
-            "The IDO pool has reach soft cap."
-        );
-
-        UserInfo storage user = userInfo[msg.sender];
-
-        uint256 _amount = user.totalInvested;
-        require(_amount > 0, "You have no investment.");
-
-        user.debt = 0;
-        user.totalInvested = 0;
-        user.total = 0;
-
-        payToken.safeTransfer(msg.sender, _amount);
-    }
+    function withdrawContribution() external nonReentrant {
+            require(isPoolCancelled || !isSoftcapReached(), "Refund not allowed: sale successful and not cancelled");
+            UserInfo storage user = userInfo[msg.sender];
+            uint256 amount = user.totalInvested;
+            require(amount > 0, "No investment");
+            require(!user.isRefunded, "Already Withdraw");
+            // reset user
+            user.debt             = 0;
+            user.isRefunded         = true;
+            user.totalInvested=0;
+            ERC20(saleInfo.Currency).safeTransfer(msg.sender, amount);
+            emit ContributionRefunded(msg.sender, amount);
+        }
 
     /// @dev Allows to claim tokens for the specific user.
     /// @param _user Token receiver.
     function claimFor(address _user) external {
-        proccessClaim(_user);
+        _processClaim(_user);
     }
 
     /// @dev Allows to claim tokens for themselves.
     function claim() external {
-        proccessClaim(msg.sender);
+        _processClaim(msg.sender);
     }
+    
+       // --------------------------------------------------------------------------------
+        // Owner-only functions
+        // --------------------------------------------------------------------------------
 
-    /// @dev Proccess the claim.
-    /// @param _receiver Token receiver.
-    function proccessClaim(address _receiver) internal nonReentrant {
-        require(
-            block.timestamp > timestamps.endTimestamp,
-            "The IDO pool has not ended."
-        );
-        UserInfo storage user = userInfo[_receiver];
+    function finalize() external onlyOwner nonReentrant {
+            require(!distributed, "Already finalized");
+            require(!isPoolCancelled, "Pool is cancelled");
 
-        uint256 _amount = user.debt;
-        require(_amount > 0, "You do not have debt tokens.");
+            require(
+                totalInvested >= saleInfo.hardCap || block.timestamp > timestamps.endTimestamp,
+                "Sale not ended yet"
+            ); 
+            // if sale is filled before end time so admin can finalize  or if sale ended so admin can claim    
+            require(totalInvested >= saleInfo.softCap, "Soft cap not met");
+                require(timestamps.claimTimestamp>0,"Frist set Claim Time");
+                uint256 contributionRemain=totalInvested;
+                // 1. Deduct platform fee
+                uint256 platformFee = (contributionRemain * feePercent) / 100;
+                contributionRemain -= platformFee;
+                ERC20(saleInfo.Currency).safeTransfer(feeWallet, platformFee);
+                // 3. Handle unsold tokens
+                uint256 unsoldToken = getUnsoldTokens();
+                // if AutoListing Enable 
+                if (saleInfo.lpInterestRate > 0 && saleInfo.listingPrice > 0) {
+               require(!doesLiquidityExist(dexInfo.factory, saleInfo.rewardToken,saleInfo.Currency),"Token Liquidity already exists it will not Finalize");
+                // calculate Currency for Lp
+                uint256 PayForLp = (contributionRemain * saleInfo.lpInterestRate) / 100;
+                contributionRemain -=  PayForLp;
+                    // calculate Token for Lp
+                uint256 tokenForLp = _getTokenAmount(
+                        PayForLp,
+                        saleInfo.listingPrice
+                    );
+                    // check unsold liquidity token
+                    unsoldToken+=saleInfo.liquidityToken-tokenForLp;
+                    // Add Liquidity ETH
+                IUniswapV2Router02 uniswapRouter = IUniswapV2Router02(dexInfo.router);
+                ERC20(saleInfo.rewardToken).approve(address(uniswapRouter), tokenForLp);
+                ERC20(saleInfo.Currency).approve(address(uniswapRouter), PayForLp);
 
-        user.debt = 0;
-        distributedTokens = distributedTokens.add(_amount);
-        rewardToken.safeTransfer(_receiver, _amount);
-        emit TokensWithdrawn(_receiver, _amount);
-    }
+                (,, uint liquidity) = uniswapRouter.addLiquidity(
+                    address(saleInfo.Currency),
+                    address(saleInfo.rewardToken),
+                    PayForLp,
+                    tokenForLp,
+                    0, // slippage is unavoidable
+                    0, // slippage is unavoidable
+                    address(this),
+                    block.timestamp + 360
+                );
+                    // Lock LP Tokens
+                address lpTokenAddress = IUniswapV2Factory(dexInfo.factory).getPair(address(saleInfo.rewardToken), saleInfo.Currency);
+                ERC20 lpToken = ERC20(lpTokenAddress);
+            
+                if (timestamps.unlockTime > 0) {
+                    lpToken.approve(address(locker), liquidity);
+                    locker.lock(
+                        msg.sender,
+                        lpTokenAddress,
+                        true,
+                        liquidity,
+                        timestamps.unlockTime+block.timestamp,
+                        string.concat(lpToken.symbol(), " tokens locker")
+                    );
+                } else {
+                    lpToken.transfer(msg.sender, liquidity);
+                }
+                    }
+                //  Handle Affiliation logic 
+                if(saleInfo.affiliation){
+                    uint256 affilationReward=affiliateInfo.currentReward-((affiliateInfo.currentReward * feePercent) / 100);
+                    affiliateInfo.totalRewardAmount=affilationReward;
+                    contributionRemain-=affilationReward;
+                }
+        //    transfer unsold token
+        if (unsoldToken > 0) {
+                    if (saleInfo.burnType) {
+                        ERC20(saleInfo.rewardToken).safeTransfer(0x000000000000000000000000000000000000dEaD, unsoldToken);
+                    } else {
+                    ERC20(saleInfo.rewardToken).safeTransfer(msg.sender, unsoldToken);
+                    }
+                }
+        // Transfer fund to admin 
+        ERC20(saleInfo.Currency).safeTransfer(msg.sender, contributionRemain);
+        distributed = true;
+         emit PoolFinalized(address(this), block.timestamp);
 
-    function getNotSoldToken() public view returns (uint256) {
-        uint256 balance = rewardToken.balanceOf(address(this));
-        return balance.add(distributedTokens).sub(tokensForDistribution);
+}
+
+    function cancelSale() external onlyOwner {
+        require(!isPoolCancelled, "Sale already cancelled");
+        require(!distributed, "Sale cannot be cancelled after finalization");
+        isPoolCancelled = true;
+        emit PoolCancelled(block.timestamp);
     }
 
     function refundTokens() external onlyOwner {
-        require(
-            block.timestamp > timestamps.endTimestamp,
-            "The IDO pool has not ended."
-        );
-        require(
-            totalInvested < saleInfo.softCap,
-            "The IDO pool has reach soft cap."
-        );
+            require(isPoolCancelled, "Pool is not canceled");
+            uint256 balance =ERC20(saleInfo.rewardToken).balanceOf(address(this));
+            require(balance > 0, "The IDO pool has not refund tokens.");
+            ERC20(saleInfo.rewardToken).safeTransfer(msg.sender, balance);
+             emit TokensRefunded(msg.sender, balance);
 
-        uint256 balance = rewardToken.balanceOf(address(this));
-        require(balance > 0, "The IDO pool has not refund tokens.");
-        rewardToken.safeTransfer(msg.sender, balance);
     }
 
-    function Finalize() external payable onlyOwner {
-        require(
-            block.timestamp > timestamps.endTimestamp,
-            "The IDO pool has not ended."
-        );
-        require(
-            totalInvested >= saleInfo.softCap,
-            "The IDO pool did not reach soft cap."
-        );
-        require(!distributed, "Already distributed.");
+function distributeTokens(uint256 startIndex, uint256 endIndex) external onlyOwner {
+    require(endIndex < participants.length, "Invalid end index");
+    require(startIndex <= endIndex, "Invalid index range");
+    require(endIndex - startIndex <= 50, "Batch size too large");
 
-        // This forwards all available gas. Be sure to check the return value!
-        // Detect Fee Amount  and Transfer
-        uint256 platformFee = totalInvested.mul(feePercent).div(10000); // 10000 for basis points
-        totalInvested = totalInvested.sub(platformFee);
-
-        //    Send Platform Fee To FeeWallet
-
-        bool success = payToken.transfer(feeWallet, platformFee);
-        require(success, "transfer Failed");
-
-        uint256 UnSoldToken = getNotSoldToken();
-        if (burnType) {
-            // Burn unsold tokens by sending to the burn address
-            rewardToken.safeTransfer(
-                0x000000000000000000000000000000000000dEaD,
-                UnSoldToken
-            );
-        } else {
-            // Ensure there are unsold tokens before withdrawing
-            require(UnSoldToken > 0, "The IDO pool has not unsold tokens.");
-            rewardToken.safeTransfer(msg.sender, UnSoldToken);
-        }
-
-        uint256 balance = payToken.balanceOf(address(this));
-        require(balance > 0, "Not Enough Fund ");
-        if (saleInfo.lpInterestRate > 0 && saleInfo.listingPrice > 0) {
-            uint256 payTokenForLp = (balance * saleInfo.lpInterestRate) / 100;
-            uint256 payTokenWithdraw = balance - payTokenForLp;
-
-            uint256 RewardtokenAmount = getTokenAmount(
-                payTokenForLp,
-                saleInfo.listingPrice
-            );
-
-            // Add Liquidity Token
-            // IUniswapV2Router02 uniswapRouter = IUniswapV2Router02(dexInfo.router);
-            // rewardToken.approve(address(uniswapRouter), tokenAmount);
-            // (,, uint liquidity) = uniswapRouter.addLiquidityETH{value: ethForLP}(
-            //     address(rewardToken),
-            //     tokenAmount,
-            //     0, // slippage is unavoidable
-            //     0, // slippage is unavoidable
-            //     address(this),
-            //     block.timestamp + 360
-            // );
-            IUniswapV2Router02 uniswapRouter = IUniswapV2Router02(
-                dexInfo.router
-            );
-            rewardToken.approve(address(uniswapRouter), RewardtokenAmount);
-            payToken.approve(address(uniswapRouter), payTokenForLp);
-            (, , uint liquidity) = uniswapRouter.addLiquidity(
-                address(rewardToken),
-                address(payToken),
-                RewardtokenAmount,
-                payTokenForLp,
-                0,
-                0,
-                address(this),
-                block.timestamp + timestamps.unlockTimestamp
-            );
-
-            // Lock LP Tokens
-            address lpTokenAddress = IUniswapV2Factory(dexInfo.factory).getPair(
-                address(rewardToken),
-                address(payToken)
-            );
-
-            ERC20 lpToken = ERC20(lpTokenAddress);
-
-            if (timestamps.unlockTimestamp > block.timestamp) {
-                lpToken.approve(address(locker), liquidity);
-                locker.lock(
-                    msg.sender,
-                    lpTokenAddress,
-                    true,
-                    liquidity,
-                    timestamps.unlockTimestamp,
-                    string.concat(lpToken.symbol(), " tokens locker")
-                );
-            } else {
-                lpToken.transfer(msg.sender, liquidity);
-                // return msg.value along with eth to output if someone sent it wrong
+    for (uint256 i = startIndex; i <= endIndex; i++) {
+        address participant = participants[i];
+        UserInfo storage user = userInfo[participant];
+        
+        if (user.debt > 0 && user.claimed == 0) {
+            _processClaim(participant);
+            // Early exit if we've distributed all tokens
+            if (distributedTokens == tokensForDistribution) {
+                break;
             }
+        }
+    }
+}
+    
 
-            // Withdraw rest Token
-            bool transferSuccess = payToken.transfer(
-                msg.sender,
-                payTokenWithdraw
-            );
-            require(transferSuccess, "Transfer failed.");
-        } else {
-            bool transferSuccess = payToken.transfer(msg.sender, balance);
-            require(transferSuccess, "Transfer failed.");
+       /**
+        * @notice RefundFund purchased tokens in batch by admin
+        */
+function refundToContributorBatch(uint256 startIndex, uint256 endIndex) external onlyOwner {
+    require(isPoolCancelled, "Pool not canceled");
+    require(endIndex < participants.length, "Invalid end index");
+    require(startIndex <= endIndex, "Invalid index range");
+    require(endIndex - startIndex <= 50, "Batch size too large");
+
+    for (uint256 i = startIndex; i <= endIndex; i++) {
+        address participant = participants[i];
+        UserInfo storage user = userInfo[participant];
+        
+        if (user.totalInvested > 0 && !user.isRefunded) {
+            uint256 amount = user.totalInvested;
+            user.debt = 0;
+            user.totalInvested = 0;
+            user.isRefunded = true;
+
+            ERC20(saleInfo.Currency).safeTransfer(participant, amount);         
+            totalRefundedCount++;
+            emit ContributionRefunded(participant, amount);
+        }
+    }
+}
+
+    function addBatchToWhitelist(address[] calldata _addresses) external onlyOwner {
+            for (uint256 i = 0; i < _addresses.length; i++) {
+            address addr = _addresses[i];
+            if (!whitelistedAddresses[addr]) {
+                whitelistedAddresses[addr] = true;
+                whitelistList.push(addr);
+                emit WhitelistUpdated(addr, true);
+            }
+    } 
+    
+    }
+
+    /**
+        * @notice Remove multiple addresses from the whitelist
+        */
+        function removeAllWhitelist() external onlyOwner {
+            if (whitelistList.length == 0) return;
+
+            for (uint256 i = 0; i < whitelistList.length; i++) {
+                address addr = whitelistList[i];
+                if (whitelistedAddresses[addr]) {
+                    whitelistedAddresses[addr] = false;
+                    emit WhitelistUpdated(addr, false);
+                }
+            }
+            delete whitelistList; // 🧹 Clean up
+}
+
+
+    function setEndAndStartTime(uint256 _start, uint256 _end) external onlyOwner {
+            require(block.timestamp <= timestamps.startTimestamp, "Sale started");
+            require(_start < _end, "Start < End");
+            require(_start > block.timestamp, "Start in future");
+            timestamps.startTimestamp = _start;
+            timestamps.endTimestamp   = _end;
+            emit TimestampsUpdated(_start, _end);
+    }
+
+    function setClaimTime(uint256 _claimTimestamp) external onlyOwner {
+            require(_claimTimestamp >= block.timestamp, "Claim time must be in the future or now");
+            timestamps.claimTimestamp = _claimTimestamp;
+            emit claimTimeUpdated(_claimTimestamp);
+
+    }
+
+   function setVesting(VestingInfo memory _vestingInfo) external {
+    require(_vestingInfo.TGEPercent>0 && _vestingInfo.TGEPercent<=100, "TGE% must be > 0 and <= 100");
+    require(_vestingInfo.releasePercent>0 && _vestingInfo.releasePercent<=100, "Release% must be > 0 and <= 100");
+    require(_vestingInfo.releasePercent+(_vestingInfo.TGEPercent)<=100, "TGE% + Release% must be <= 100");
+    require(_vestingInfo.cycleTime>0, "Cycle time must be > 0");
+    _vestingInfo.startTime=0;
+    vestingInfo=_vestingInfo;
+    emit VestingUpdated(
+        _vestingInfo.TGEPercent,
+        _vestingInfo.cycleTime,
+        _vestingInfo.releasePercent,
+        _vestingInfo.startTime
+    );
+   }
+
+    function whitelistEnabled() external onlyOwner {
+        require(!distributed, "Sale cannot be Enable WhiteListing after finalization");
+        require(!saleInfo.isEnableWhiteList,"Sale Already WhiteListed");
+        require(block.timestamp < timestamps.startTimestamp, "Cannot change whitelist settings after sale starts"); 
+        saleInfo.isEnableWhiteList=true;
+        emit SaleTypeChanged(true);
+
+    }
+        
+    function publicSaleEanble() external onlyOwner{
+        require(block.timestamp<=timestamps.endTimestamp,"sale is ended can't update public");
+        require(!distributed, "cannot be Enable public  Sale after finalization");   
+        require(saleInfo.isEnableWhiteList,"Sale Already WhiteListed");
+        require(block.timestamp < timestamps.startTimestamp, "Cannot change public settings after sale starts"); 
+        saleInfo.isEnableWhiteList=false;
+        emit SaleTypeChanged(false);
+    }
+
+    function enableAffilate(bool _enabled, uint8 _rate) external  onlyOwner {
+        // Sale status check
+        require(
+        getSaleStatus() == SaleStatus.Upcoming || 
+        getSaleStatus() == SaleStatus.Live,
+        "Affiliation Can only enable before sale end"
+    );
+        require(_rate <= 5, "Affiliation rate max is 5%");
+        saleInfo.affiliation = _enabled;
+        // Only update rate if enabling or rate is changing
+        if (_enabled || affiliateInfo.realTimeRewardPercentage != _rate) {
+        affiliateInfo.realTimeRewardPercentage = _rate;
+        affiliateInfo.maxReward=(saleInfo.hardCap*_rate)/100;
+    }
+     emit AffiliateUpdated(_enabled, _rate);
+
+    }
+
+        // --------------------------------------------------------------------------------
+        // Public / view
+        // --------------------------------------------------------------------------------
+
+
+    function getParticipantsCount() external view returns (uint256) {
+     return participants.length;
+    }
+    
+
+    function getSaleStatus() public view returns (SaleStatus) {
+        if (isPoolCancelled) {
+            return SaleStatus.Cancelled;
+        }
+        if (block.timestamp < timestamps.startTimestamp) {
+            return SaleStatus.Upcoming;
+        }
+        if (block.timestamp >= timestamps.endTimestamp) {
+            return SaleStatus.Ended;
         }
 
-        distributed = true;
+        // This block only runs if sale is ongoing
+        if (
+            block.timestamp >= timestamps.startTimestamp &&
+            block.timestamp < timestamps.endTimestamp
+        ) {
+            if (totalInvested >= saleInfo.hardCap) {
+                return SaleStatus.Filled;
+            } else {
+                return SaleStatus.Live;
+            }
+        }
+        return SaleStatus.Ended; // Fallback
+    }
+    
+    function isSaleFilled() public view returns (bool) {
+            return totalInvested >= saleInfo.hardCap;
+        }
+
+    function getUnsoldTokens() public view returns(uint256) {
+            return saleInfo.presaleToken - tokensForDistribution;
+        }
+
+    function isAffiliation() external  view returns(bool){
+            return saleInfo.affiliation;
+    } 
+
+    
+    function _getTokenAmount(uint256 currrencyAmount, uint256 price) internal   view returns (uint256) {
+            return (currrencyAmount * price ) / (10 ** decimals);
     }
 
-    function getTokenAmount(
-        uint256 payTokenAmount,
-        uint256 RewardToken
-    ) internal view returns (uint256) {
-        return (payTokenAmount / RewardToken) * 10 ** decimals;
+
+    function getSaleType() external view returns (string memory) {
+        return saleInfo.isEnableWhiteList ? "Whitelist" : "Public";
     }
-    /**
-     * @notice It allows the owner to recover wrong tokens sent to the contract
-     * @param _tokenAddress: the address of the token to withdraw with the exception of rewardToken
-     * @param _tokenAmount: the number of token amount to withdraw
-     * @dev Only callable by owner.
-     */
-    function recoverWrongTokens(
-        address _tokenAddress,
-        uint256 _tokenAmount
-    ) external onlyOwner {
-        require(_tokenAddress != address(rewardToken));
-        ERC20(_tokenAddress).safeTransfer(address(msg.sender), _tokenAmount);
+
+    function getAllParticipant () external view returns(address [] memory){
+        return  participants;
     }
+    
+    function isSalePublic() external view returns (bool) {
+        return !saleInfo.isEnableWhiteList;
+    }
+
+
+
+    function getTotalParticipantCount() external view returns(uint256){
+        return participants.length;
+    }
+
+    function getClaimableTokenAmount(address _user) external view returns (uint256) { 
+        UserInfo storage user = userInfo[_user];
+        uint256 totalTokenAmount = user.debt;
+        if (totalTokenAmount == 0) {
+            return 0; // No tokens to claim
+        }
+          // If vesting is not enabled, check if already claimed
+         if (!saleInfo.isVestingEnabled || vestingInfo.startTime == 0) {
+             return user.claimed > 0 ? 0 : totalTokenAmount;
+         }
+
+        uint256 vestedAmount = getVestedAmount(totalTokenAmount);
+        if (vestedAmount <= user.claimed) {
+            return 0; // No new tokens available to claim
+        }
+        
+        return vestedAmount-user.claimed;
+        
+    }
+    function getVestedAmount(uint256 _totalAmount) public view returns (uint256) {
+    // If vesting hasn't started yet, nothing is vested
+     if (block.timestamp < vestingInfo.startTime) {
+             return 0;
+         }
+
+        // Calculate TGE portion
+        uint256 tgePortion = _totalAmount*(vestingInfo.TGEPercent)/(100);
+        uint256 vestedAmount = tgePortion;
+
+        // Calculate additional vested amount based on cycles elapsed
+        uint256 timeSinceTGE = block.timestamp-vestingInfo.startTime;
+
+        // Only calculate cycle-based vesting if necessary parameters are set
+        if (timeSinceTGE > 0 && vestingInfo.cycleTime > 0 && vestingInfo.releasePercent > 0) {
+            uint256 cyclesElapsed = timeSinceTGE/(vestingInfo.cycleTime);
+
+            // Calculate amount vested per cycle
+            uint256 remainingAfterTGE = _totalAmount-(tgePortion);
+            uint256 cycleUnlockPerCycle = remainingAfterTGE*(vestingInfo.releasePercent)/(100);
+
+            // Calculate total amount unlocked through cycles
+            uint256 totalCycleUnlock = cycleUnlockPerCycle*(cyclesElapsed);
+
+            // Add cycle unlocks to TGE portion
+            vestedAmount = vestedAmount+(totalCycleUnlock);
+
+            // Cap at total allocation
+            if (vestedAmount > _totalAmount) {
+                vestedAmount = _totalAmount;
+            }
+    }
+
+    return vestedAmount;
+}
+
+   
+
+    function isPoolUser(address _user) external view returns ( bool){
+        UserInfo storage user = userInfo[_user];
+        return user.totalInvested>0?true :false;
+    }
+
+    function isPoolCancel() external view  returns(bool){
+        return  isPoolCancelled;
+    }
+
+    function getClaimedTokenAmount (address _user) external view returns (uint256){
+        UserInfo storage user = userInfo[_user];
+        return  user.claimed;
+    }
+    
+    function getTotalInvesment() external view returns(uint256){
+        return  totalInvested;
+    }
+
+    function getFeePecetage() external view returns (uint8){
+    return feePercent;
+    }
+
+    function getSaleInfo() external view returns (SaleInfo memory){
+        return saleInfo;
+    }
+    
+    function getTimesatmpInfo() external view returns  (Timestamps memory){
+        return timestamps;
+    }
+    
+    function getAllSponesers() external view returns (address[] memory) {
+        return sponeserAddress;
+    }
+
+    function getSponserRewardAmount(address _sponsor) external view returns (uint256) {
+        if (sponsorClaimed[_sponsor]) return 0;
+        uint256 raw = sponserReward[_sponsor];
+        uint256 fee = (raw * feePercent) / 100;
+        return raw - fee;
+    }
+
+    function getSponsorReferralSum(address _sponser) external view returns (uint256) {
+        return sponsorReferralSum[_sponser];
+    }
+
+    function getAffiliateInfo() external view returns (AffiliateInfo memory) {
+        return affiliateInfo;
+    }
+
+    function getIsSponsorClaimed(address _sponser) external view returns (bool) {
+        return sponsorClaimed[_sponser];
+    }
+
+    function getUserInvesmentAmount(address _user) external view returns (uint256){
+        UserInfo storage user = userInfo[_user];
+        return user.totalInvested;
+    }
+
+    function isPoolFinalize() external view  returns (bool){
+        return distributed;
+    }
+
+    function isClaimTimeSet() external view returns (bool) {
+    return timestamps.claimTimestamp > 0;
+}
+
+function isSoftcapReached() public view returns (bool) {
+    return totalInvested >= saleInfo.softCap;
+}
+
+   
+function isAllRefundCompleted() external view returns(bool){
+        return participants.length==totalRefundedCount;
+    }
+
+function isDistributionCompleted() external view returns(bool){
+        return distributedTokens==tokensForDistribution;
+}
+
+function doesLiquidityExist(
+    address factory,
+    address tokenA,
+    address tokenB
+) public view returns (bool) {
+    address pair = IUniswapV2Factory(factory).getPair(tokenA, tokenB);
+    if (pair == address(0)) {
+        return false; // Pair does not exist
+    }
+    (uint112 reserve0, uint112 reserve1, ) = IUniswapV2Pair(pair).getReserves();
+    return reserve0 > 0 && reserve1 > 0;
+}
+
+
+
+// --------------------------------------------------------------------------------
+    // Internal
+    // --------------------------------------------------------------------------------
+    
+    function _processClaim(address _receiver) internal nonReentrant {
+            require(!isPoolCancelled, "Cancelled");
+            require(distributed, "Wait for Pool Finalize");
+            require(timestamps.claimTimestamp > 0, "Claim time not set");
+            require(block.timestamp >= timestamps.claimTimestamp, "Claim not started");
+            require(totalInvested >= saleInfo.softCap, "Soft cap not met");
+            UserInfo storage user = userInfo[_receiver];
+            uint256 totalTokenAmount = user.debt;
+            require(totalTokenAmount > 0, "No tokens to claim");
+            uint256 availableToClaimNow;
+            if (!saleInfo.isVestingEnabled || vestingInfo.startTime == 0) {
+                 require(user.claimed == 0, "Already claimed");
+                 // Claim full amount
+               availableToClaimNow = totalTokenAmount;
+               user.debt = 0;
+            }
+            else{
+               // Vesting is enabled - calculate available amount
+            uint256 vestedAmount = getVestedAmount(totalTokenAmount);
+            require(vestedAmount > 0, "No tokens vested yet");
+                     // Calculate unclaimed vested tokens
+            uint256 unclaimedVested = vestedAmount > user.claimed ?
+            vestedAmount-user.claimed : 0;
+
+            require(unclaimedVested > 0, "No new tokens available to claim");
+        
+            availableToClaimNow = unclaimedVested;
+        
+            // If all tokens are claimed, clear the debt
+            if (vestedAmount >= totalTokenAmount) {
+                user.debt = 0;
+            }
+     }    
+    
+   // Update claimed amount
+    user.claimed = user.claimed+availableToClaimNow;
+    
+    // Update global tracking
+    distributedTokens = distributedTokens+availableToClaimNow;
+    
+    // Transfer tokens
+    ERC20(saleInfo.rewardToken).safeTransfer(_receiver, availableToClaimNow);
+    
+    emit ContributionRefunded(_receiver, availableToClaimNow);
+}
+
+ function _handleAffiliate(address _sponsor, uint256 amount) internal {
+            if (_sponsor != address(0) && _sponsor != msg.sender) {
+                if (sponsorReferralSum[_sponsor] == 0) {
+                    sponeserAddress.push(_sponsor);
+                    affiliateInfo.poolRefCount++;
+                }
+                sponsorReferralSum[_sponsor] += amount;
+                uint256 reward = (affiliateInfo.realTimeRewardPercentage * amount) / 100;
+                sponserReward[_sponsor] += reward;
+                affiliateInfo.totalReferredAmount += amount;
+                affiliateInfo.currentReward += reward;
+            }
+    }   
+
 }

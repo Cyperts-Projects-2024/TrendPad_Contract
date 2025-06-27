@@ -6,10 +6,10 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "./SafeMath.sol";
 
 interface IPancakeRouter {
-    function WETH() external pure returns (address);
     
     function swapExactETHForTokensSupportingFeeOnTransferTokens(
         uint amountOutMin,
@@ -17,6 +17,14 @@ interface IPancakeRouter {
         address to,
         uint deadline
     ) external payable;
+
+    function swapExactTokensForTokensSupportingFeeOnTransferTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external;
 }
 
 interface IBurnableToken {
@@ -25,13 +33,15 @@ interface IBurnableToken {
     function transfer(address recipient, uint256 amount) external returns (bool);
 }
 
-contract BuyBackManager is Initializable, OwnableUpgradeable , ReentrancyGuardUpgradeable {
+contract BuyBackManagerV2 is Initializable, OwnableUpgradeable , ReentrancyGuardUpgradeable ,UUPSUpgradeable {
     
     using SafeMath for uint256;
     using SafeERC20 for IERC20;    
 
+
     struct BuyBackConfig {
-     address tokenAddress;
+        address tokenAddress;
+        address tokenBAddress; // Optional, if needed for dual token pools
         address routerAddress;
         uint8 percentage;
         uint256 totalBuyBackAmount;
@@ -42,6 +52,7 @@ contract BuyBackManager is Initializable, OwnableUpgradeable , ReentrancyGuardUp
         uint256 nextbuyBackTime;
         uint256 lastbuyBackTime;
         bool isConfigured;
+        bool isNative;
     }
     
     uint256 public amountPerBuyBack;
@@ -51,27 +62,30 @@ contract BuyBackManager is Initializable, OwnableUpgradeable , ReentrancyGuardUp
     mapping(address => BuyBackConfig) public poolConfig;
     mapping(address => uint256) public buyBackAmount;
     mapping(address => bool) public isAllowed;
+    uint private  MAX_PERCENTAGE ;
+     uint private x;
+          uint private y;
+
+    address public authorizedAddress;
 
     // Events
     event BuybackAndBurn(address indexed pool, address indexed token, uint256 amount);
-    event PoolConfigured(address indexed pool, address indexed token, uint8 percentage);
+    event PoolConfigured(address indexed pool, address indexed tokenA, address tokenB,  uint8 percentage);
     event PoolFinalized(address indexed pool, uint256 amount);
     event PermissionUpdated(address indexed user, bool allowed);
 
    function initialize(uint256 _amountPerBuyBack, uint256 _minBuyBackDeley, uint256 _maxBuyBackDeley) public initializer {
-                __Ownable_init(msg.sender);
+         __Ownable_init(msg.sender);
         __ReentrancyGuard_init();
         amountPerBuyBack = _amountPerBuyBack;
         minBuyBackDeley = _minBuyBackDeley;
         maxBuyBackDeley = _maxBuyBackDeley;
     }
-    
-    // Function to set permissions for pool owners/factory
-    function setAllowed(address _user, bool _allowed) external  {
-        isAllowed[_user] = _allowed;
-        emit PermissionUpdated(_user, _allowed);
-    }
-
+      function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyOwner
+    {}
     modifier onlyAuthorized(address _pool,address _user) {
     require(_pool != address(0), "Invalid pool address");
     require(_user != address(0), "Invalid user address");
@@ -79,7 +93,7 @@ contract BuyBackManager is Initializable, OwnableUpgradeable , ReentrancyGuardUp
     require(poolConfig[_pool].isConfigured, "Pool not configured or not finalized");
     _;
 }
-    
+
     // Set global buyback parameters
     function setGlobalBuyBackParams(
         uint256 _amountPerBuyBack,
@@ -92,21 +106,25 @@ contract BuyBackManager is Initializable, OwnableUpgradeable , ReentrancyGuardUp
         maxBuyBackDeley = _maxBuyBackDeley;
     }
 
-
     function setBuybackConfig(
             address _pool,
-            address _tokenAddress,
+            address _tokenAAddress,
+            address _tokenBAddress,
             address _routerAddress,
             uint8 _percentage,
-            uint256 _totalBuyBackAmount
+            uint256 _totalBuyBackAmount,
+            bool isNativeStatus
         ) external  {
             require(_pool != address(0), "Invalid pool address");
-            require(_tokenAddress != address(0), "Invalid token address");
+            require(_tokenAAddress != address(0), "Invalid token address");
+            require(_tokenBAddress != address(0), "Invalid token B address");
+            require(_routerAddress != address(0), "Invalid router address");
             require(_percentage > 0 && _percentage <= 100, "Percentage must be between 1-100");
             require(_totalBuyBackAmount > 0, "Total buyback amount must be > 0");
             
             poolConfig[_pool] = BuyBackConfig({
-                tokenAddress: _tokenAddress,
+                tokenAddress: _tokenAAddress,
+                tokenBAddress: _tokenBAddress,
                 routerAddress: _routerAddress,
                 percentage: _percentage,
                 totalBuyBackAmount:_totalBuyBackAmount,
@@ -114,12 +132,13 @@ contract BuyBackManager is Initializable, OwnableUpgradeable , ReentrancyGuardUp
                 AmountPerBuyBack: amountPerBuyBack,
                 minBuyBackDeley: minBuyBackDeley,
                 maxBuyBackDeley: maxBuyBackDeley,
-                nextbuyBackTime: 0, // Will be set during finalization
-                lastbuyBackTime: 0,  // Will be set during finalization
-                isConfigured: false
+                nextbuyBackTime: 0, 
+                lastbuyBackTime: 0,  
+                isConfigured: false,
+                isNative: isNativeStatus
             });
         
-            emit PoolConfigured(_pool, _tokenAddress, _percentage);
+            emit PoolConfigured(_pool, _tokenAAddress,_tokenBAddress, _percentage);
         }
 
     function getBuyBackDefaultInfo() external view returns (
@@ -139,21 +158,26 @@ contract BuyBackManager is Initializable, OwnableUpgradeable , ReentrancyGuardUp
         return buyBackAmount[_pool];
     }
 
-    function finalizeBuyBackConfig(address _pool) external payable  {
+    function finalizeBuyBackConfig(address _pool,uint256 _amount) external payable {
         require(_pool != address(0), "Invalid pool address");
         require(!poolConfig[_pool].isConfigured, "Pool already configured");
         require(poolConfig[_pool].totalBuyBackAmount > 0, "Total buyback amount must be > 0");
-        require(msg.value > 0, "Must send ETH for buybacks");
-        
-        buyBackAmount[_pool] = msg.value;
-        
-        BuyBackConfig storage config = poolConfig[_pool];
+         BuyBackConfig storage config = poolConfig[_pool];
+        if (config.isNative) {
+        require(msg.value == _amount, "ETH amount mismatch");
+    } else {
+        require(msg.value == 0, "Don't send ETH for token buybacks");
+        IERC20(config.tokenBAddress).safeTransferFrom(msg.sender, address(this), _amount);
+    }
+
+        buyBackAmount[_pool] = _amount;
+       
         config.isConfigured = true;
-        config.totalBuyBackAmount=msg.value;
+        config.totalBuyBackAmount=_amount;
         config.nextbuyBackTime = block.timestamp.add(config.minBuyBackDeley);
         config.lastbuyBackTime = block.timestamp;
         
-        emit PoolFinalized(_pool, msg.value);
+        emit PoolFinalized(_pool, _amount);
     }
     
     function buybackAndBurn(address _pool) nonReentrant onlyAuthorized(_pool,msg.sender) external  {
@@ -161,7 +185,7 @@ contract BuyBackManager is Initializable, OwnableUpgradeable , ReentrancyGuardUp
         uint256 availableBuyback = buyBackAmount[_pool];
         require(config.boughtBackAmount < config.totalBuyBackAmount, "Total buyback amount reached");
         require(block.timestamp >= config.nextbuyBackTime, "Buyback not ready yet");
-        require(availableBuyback > 0, "No ETH available for buyback");
+        require(availableBuyback > 0, "No Fund available for buyback");
 
         // Determine amount to use for this buyback
         uint256 amountToUse = availableBuyback >= config.AmountPerBuyBack 
@@ -170,17 +194,22 @@ contract BuyBackManager is Initializable, OwnableUpgradeable , ReentrancyGuardUp
             
         // Create swap path
         address[] memory path = new address[](2);
-        path[0] = IPancakeRouter(config.routerAddress).WETH();
+        path[0] = config.tokenBAddress;
         path[1] = config.tokenAddress;
         
         // Execute swap
-        IPancakeRouter(config.routerAddress).swapExactETHForTokensSupportingFeeOnTransferTokens{value: amountToUse}(
-            0, // Accept any amount (no slippage protection)
-            path,
-            address(this),
-            block.timestamp + 300 // 5 minutes deadline
-        );
-        
+if (config.isNative) {
+    // Use ETH as input
+    IPancakeRouter(config.routerAddress).swapExactETHForTokensSupportingFeeOnTransferTokens{value: amountToUse}(
+        0, path, address(this), block.timestamp + 300
+    );
+} else {
+    // Use token (e.g., USDT) as input
+    IERC20(config.tokenBAddress).approve(config.routerAddress, amountToUse);
+    IPancakeRouter(config.routerAddress).swapExactTokensForTokensSupportingFeeOnTransferTokens(
+        amountToUse, 0, path, address(this), block.timestamp + 300
+    );
+}
         // Get token balance
         address token = config.tokenAddress;
         uint256 tokenAmount = IBurnableToken(token).balanceOf(address(this));
@@ -195,7 +224,7 @@ contract BuyBackManager is Initializable, OwnableUpgradeable , ReentrancyGuardUp
         }
         
         // Update state
-        config.boughtBackAmount = config.boughtBackAmount.add(tokenAmount);
+        config.boughtBackAmount = config.boughtBackAmount.add(amountToUse);
         config.lastbuyBackTime = block.timestamp;
         
         // Calculate next buyback time
@@ -223,8 +252,13 @@ contract BuyBackManager is Initializable, OwnableUpgradeable , ReentrancyGuardUp
         }
         return rs;
     }
-    
+
+
+  function demo()public  pure returns(string memory){
+    return "Ekoo";
+  }
     
     // Allow receiving ETH
     receive() external payable {}
+  
 }

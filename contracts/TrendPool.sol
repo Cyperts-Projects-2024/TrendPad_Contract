@@ -8,7 +8,7 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "./IUniswapV2Router02.sol";
 import "./IUniswapV2Factory.sol";
-// import "./ITrendLock.sol";
+import "./IUniswapV2Pair.sol";
 interface ITrendLock {
     function lock(
         address _withdrawer,
@@ -20,29 +20,30 @@ interface ITrendLock {
     ) external;
 }
 
-    contract TrendPool is Initializable,OwnableUpgradeable, ReentrancyGuardUpgradeable {
+contract TrendPoolV2 is Initializable,OwnableUpgradeable, ReentrancyGuardUpgradeable {
         using SafeERC20 for ERC20;
 
         // --------------------------------------------------------------------------------
         // Structures
         // --------------------------------------------------------------------------------
 
-            struct SaleInfo {
-                address rewardToken;
-                uint256 presaleToken;
-                uint256 liquidityToken;
-                uint256 tokenPrice;    // Price per token in WEI
-                uint256 softCap;       // Min ETH required
-                uint256 hardCap;       // Max ETH raised
-                uint256 minEthPayment; // Min contribution
-                uint256 maxEthPayment; // Max contribution
-                uint256 listingPrice;  // (Optional) listing price in WEI
-                uint256 lpInterestRate;// (Optional) % of raised ETH for LP
-                bool  burnType;
-                string metadataURL;
-                bool affiliation; 
-                bool isEnableWhiteList ;    // (Unused flag; we do actual affiliate logic below)
-            }
+                struct SaleInfo {
+                    address Currency; 
+                    address rewardToken;
+                    uint256 presaleToken;
+                    uint256 liquidityToken;
+                    uint256 tokenPrice;    // Price per token in WEI
+                    uint256 softCap;       // Min ETH required
+                    uint256 hardCap;       // Max ETH raised
+                    uint256 minEthPayment; // Min contribution
+                    uint256 maxEthPayment; // Max contribution
+                    uint256 listingPrice;  // (Optional) listing price in WEI
+                    uint256 lpInterestRate;// (Optional) % of raised ETH for LP
+                    bool  burnType;
+                    bool affiliation; 
+                    bool isEnableWhiteList ;
+                    bool isVestingEnabled;
+                }
 
         struct Timestamps {
             uint256 startTimestamp;  
@@ -61,7 +62,15 @@ interface ITrendLock {
             uint256 debt;            
             uint256 claimed;           
             uint256 totalInvestedETH;
+            bool isRefunded; 
         }
+
+    struct VestingInfo {
+            uint8 TGEPercent;
+            uint256 cycleTime;
+            uint8 releasePercent;
+            uint256 startTime;
+    }
 
     struct AffiliateInfo {             
         uint8 poolRefCount;            // Total number of users referred
@@ -71,11 +80,10 @@ interface ITrendLock {
         uint256 totalReferredAmount; // Total amount referred by user
         uint256 totalRewardAmount;    
     }
-        // --------------------------------------------------------------------------------
-        // Public state
-        // --------------------------------------------------------------------------------
+    // --------------------------------------------------------------------------------
+    // Public state
+    // --------------------------------------------------------------------------------
 
-        uint256  public tokenDecimals;
         address  public feeWallet;
         uint8  public feePercent;       // fee in basis points
         bool     public isPoolCancelled;
@@ -83,10 +91,12 @@ interface ITrendLock {
         Timestamps public timestamps;
         DEXInfo    public dexInfo;
         AffiliateInfo public affiliateInfo;
+        VestingInfo public vestingInfo;
         ITrendLock public locker;
         uint256 public totalInvestedETH;    // total ETH raised
         uint256 public tokensForDistribution;
         uint256 public distributedTokens; 
+        uint256 totalRefundedCount;
         bool  public distributed;
         enum SaleStatus {
         Cancelled,
@@ -108,16 +118,29 @@ interface ITrendLock {
         // --------------------------------------------------------------------------------
         // Events
         // --------------------------------------------------------------------------------
-        event TokensDebt(address indexed holder, uint256 ethAmount, uint256 tokenForLp);
+        event TokensDebt(address indexed holder, uint256 ethAmount, uint256 tokenAmount);
         event PoolCancelled(uint256 timestamp);
         event TimestampsUpdated(uint256 startTimestamp, uint256 endTimestamp);
-        event TokensWithdrawn(address indexed holder, uint256 amount);
+        event TokensClaimed(address indexed holder, uint256 amount);
         event WhitelistUpdated(address indexed user, bool status);
         // Affiliate-specific events
         event SponsorSet(address indexed user, address indexed sponsor);
         event SponsorRewardClaimed(address indexed sponsor, uint256 amount);
+        event ContributionRefunded(address indexed user, uint256 amount);
+        event PoolFinalized(address indexed pool, uint256 timestamp);
+        event TokensRefunded(address indexed user, uint256 amount);
+        event SaleTypeChanged(bool status);
+        event AffiliateUpdated(bool enabled, uint8 rate);
+        event claimTimeUpdated(uint256 claimTimestamp);
+        event VestingUpdated(
+        uint8 TGEPercent,
+        uint256 cycleTime,
+        uint8 releasePercent,
+        uint256 startTime
+    );
+
         // --------------------------------------------------------------------------------
-        // Constructor
+        // Initialization
         // --------------------------------------------------------------------------------
 
         function initialize(
@@ -126,41 +149,19 @@ interface ITrendLock {
             DEXInfo memory _dexInfo,
             address _locker,
             address _feeWallet,
-            uint8 _feePercent,
-            uint8 _affiliateRate
+            uint8 _feePercent
         ) public initializer {
             __Ownable_init(msg.sender);
             __ReentrancyGuard_init();
-            require(
-                _timestamps.startTimestamp < _timestamps.endTimestamp,
-                "Start < End required"
-            );
-            require(
-                _timestamps.endTimestamp > block.timestamp,
-                "End must be > now"
-            );
-    require(
-        _timestamps.unlockTime == 0 || _timestamps.unlockTime >= 180,
-        "Unlock time must be >= 3 mins or 0 (no lock)"
-    );
             timestamps = _timestamps;
-            require(_saleInfo.lpInterestRate >= 51 || _saleInfo.lpInterestRate==0, "LP% must be >= 51%");
-            require(
-                _saleInfo.softCap <= _saleInfo.hardCap &&
-                (_saleInfo.hardCap * 25) / 100 <= _saleInfo.softCap,
-                "SoftCap must be >= 25% of HardCap"
-            );
             saleInfo = _saleInfo;
             dexInfo = _dexInfo;
             locker = ITrendLock(_locker);
             feeWallet = _feeWallet;
             feePercent = _feePercent;
-            tokenDecimals = ERC20(saleInfo.rewardToken).decimals();
-            if(_saleInfo.affiliation){
-                affiliateInfo.realTimeRewardPercentage=_affiliateRate;
-                affiliateInfo.maxReward=(_saleInfo.hardCap*_affiliateRate)/100;
-            }
         }
+
+        // Add this function anywhere in your contract
         // --------------------------------------------------------------------------------
         // Public user functions
         // --------------------------------------------------------------------------------
@@ -227,16 +228,20 @@ interface ITrendLock {
         }
 
         function withdrawContribution() external nonReentrant {
-            require(isPoolCancelled, "Pool not cancelled && soft cap is Meet    ");
+            require(isPoolCancelled || !isSoftcapReached(), "Refund not allowed: sale successful Reach SoftCap and not cancelled");
             // require(totalInvestedETH < saleInfo.softCap, "Soft cap reached");
             UserInfo storage user = userInfo[msg.sender];
             uint256 amount = user.totalInvestedETH;
-            require(amount > 0, "No investment");
+            require(!user.isRefunded, "Already refunded");
+            require(amount > 0, "No investment Found");
             // reset user
             user.debt             = 0;
-            user.totalInvestedETH = 0;//it may be change when sale is cancel 
+            user.totalInvestedETH = 0; 
+            user.isRefunded=true;
             (bool success, ) = msg.sender.call{value: amount}("");
             require(success, "Refund fail");
+            totalRefundedCount++;
+             emit ContributionRefunded(msg.sender, amount);
         }
 
         // --------------------------------------------------------------------------------
@@ -248,6 +253,8 @@ interface ITrendLock {
         */
         function finalize() external onlyOwner nonReentrant {
             require(!distributed, "Already finalized");
+            require(!isPoolCancelled, "Pool is cancelled");
+
             require(
                 totalInvestedETH >= saleInfo.hardCap || block.timestamp > timestamps.endTimestamp,
                 "Sale not ended yet"
@@ -265,6 +272,7 @@ interface ITrendLock {
                 uint256 unsoldToken = getUnsoldTokens();
                 // if AutoListing Enable 
                 if (saleInfo.lpInterestRate > 0 && saleInfo.listingPrice > 0) {
+                    require(!doesLiquidityExist(dexInfo.factory, saleInfo.rewardToken, dexInfo.weth),"Token Liquidity already exists it will not Finalize");
                     // calculate ETh for Lp
                     uint256 ethForLp = (contributionRemain * saleInfo.lpInterestRate) / 100;
                     contributionRemain -=  ethForLp;
@@ -311,7 +319,7 @@ interface ITrendLock {
                     contributionRemain-=affilationReward;
                 }
         //    transfer unsold token
-        if (unsoldToken > 0) {
+                if (unsoldToken > 0) {
                     if (saleInfo.burnType) {
                         ERC20(saleInfo.rewardToken).safeTransfer(0x000000000000000000000000000000000000dEaD, unsoldToken);
                     } else {
@@ -322,6 +330,8 @@ interface ITrendLock {
                 (bool success, ) = msg.sender.call{value: contributionRemain}("");
                 require(success, "Transfer failed.");
                 distributed = true;
+             emit PoolFinalized(address(this), block.timestamp);
+
             }
 
         /**
@@ -341,19 +351,55 @@ interface ITrendLock {
             uint256 balance =ERC20(saleInfo.rewardToken).balanceOf(address(this));
             require(balance > 0, "The IDO pool has not refund tokens.");
             ERC20(saleInfo.rewardToken).safeTransfer(msg.sender, balance);
+            emit TokensRefunded(msg.sender, balance);
         }
         /**
         * @notice Distribute purchased tokens in batch by admin
         */
-        function distributeTokens() external onlyOwner {
-            require(tokensForDistribution!=distributedTokens,"Token Already distributes");
-            for (uint256 i = 0; i <participants.length;i++) {
-                    UserInfo storage user = userInfo[participants[i]];
-                    if(user.claimed==0){
-                    _processClaim(participants[i]);
-                }
+function distributeTokens(uint256 startIndex, uint256 endIndex) external onlyOwner {
+    require(endIndex < participants.length, "Invalid end index");
+    require(startIndex <= endIndex, "Invalid index range");
+    require(endIndex - startIndex <= 50, "Batch size too large");
+
+    for (uint256 i = startIndex; i <= endIndex; i++) {
+        address participant = participants[i];
+        UserInfo storage user = userInfo[participant];
+        
+        if (user.debt > 0 && user.claimed == 0) {
+            _processClaim(participant);
+            // Early exit if we've distributed all tokens
+            if (distributedTokens == tokensForDistribution) {
+                break;
             }
         }
+    }
+}
+        
+       /**
+        * @notice RefundFund purchased tokens in batch by admin
+    */
+function refundToContributorBatch(uint256 startIndex, uint256 endIndex) external onlyOwner {
+    require(isPoolCancelled, "Pool not canceled");
+    require(endIndex < participants.length, "Invalid end index");
+    require(startIndex <= endIndex, "Invalid index range");
+
+    for (uint256 i = startIndex; i <= endIndex; i++) {
+        address participant = participants[i];
+        UserInfo storage user = userInfo[participant];
+        
+        if (user.totalInvestedETH > 0 && !user.isRefunded) {
+            uint256 amount = user.totalInvestedETH;
+            user.debt = 0;
+            user.totalInvestedETH = 0;
+            user.isRefunded = true;
+            (bool success, ) = participant.call{value: amount}("");
+            require(success, "Refund failed");           
+            totalRefundedCount++;
+            emit ContributionRefunded(participant, amount);
+        }
+    }
+}
+
         /**
         * @notice Add multiple addresses to the whitelist
         */
@@ -397,22 +443,36 @@ interface ITrendLock {
         /**
         * @notice Set new claim time
         */
-    function setClaimTime(uint256 _claimTimestamp) external onlyOwner {
-            require(_claimTimestamp >= block.timestamp, "Claim time must be in the future or now");
-            timestamps.claimTimestamp = _claimTimestamp;
-    }
+       function setClaimTime(uint256 _claimTimestamp) external onlyOwner {
+               require(_claimTimestamp >= block.timestamp, "Claim time must be in the future or now");
+            
+               timestamps.claimTimestamp = _claimTimestamp;
+               emit claimTimeUpdated(_claimTimestamp);
+       }
 
-        /**
-        * @notice Enable or disable whitelist and public 
-        */
-   
-   
-   
+
+     function setVesting(VestingInfo memory _vestingInfo) external {
+     require(_vestingInfo.TGEPercent>0 && _vestingInfo.TGEPercent<=100, "TGE% must be > 0 and <= 100");
+     require(_vestingInfo.releasePercent>0 && _vestingInfo.releasePercent<=100, "Release% must be > 0 and <= 100");
+     require(_vestingInfo.releasePercent+(_vestingInfo.TGEPercent)<=100, "TGE% + Release% must be <= 100");
+     require(_vestingInfo.cycleTime>0, "Cycle time must be > 0");
+     _vestingInfo.startTime=0;
+     vestingInfo=_vestingInfo;
+     emit VestingUpdated(
+         _vestingInfo.TGEPercent,
+         _vestingInfo.cycleTime,
+         _vestingInfo.releasePercent,
+         _vestingInfo.startTime
+     );
+}
+
     function whitelistEnabled() external onlyOwner {
         require(!distributed, "Sale cannot be Enable WhiteListing after finalization");
         require(!saleInfo.isEnableWhiteList,"Sale Already WhiteListed");
         require(block.timestamp < timestamps.startTimestamp, "Cannot change whitelist settings after sale starts"); 
         saleInfo.isEnableWhiteList=true;
+        emit SaleTypeChanged(true);
+
     }
         
     function publicSaleEanble() external onlyOwner{
@@ -421,14 +481,8 @@ interface ITrendLock {
         require(saleInfo.isEnableWhiteList,"Sale Already WhiteListed");
         require(block.timestamp < timestamps.startTimestamp, "Cannot change public settings after sale starts"); 
         saleInfo.isEnableWhiteList=false;
-    }
+        emit SaleTypeChanged(false);
 
-        /**
-        * @notice Update the pool metadata
-        */
-    
-    function setMetadataURL(string memory _url) external onlyOwner {
-        saleInfo.metadataURL = _url;
     }
 
         /**
@@ -438,12 +492,21 @@ interface ITrendLock {
         */
     
     function enableAffilate(bool _enabled, uint8 _rate) external  onlyOwner {
-        // Sale status check
-        require(getSaleStatus() == SaleStatus.Upcoming, "Can only enable before sale starts");
+        // Sale status check   
+        require(
+        getSaleStatus() == SaleStatus.Upcoming || 
+        getSaleStatus() == SaleStatus.Live,
+        "Affiliation Can only enable before sale end"
+    );
         require(_rate <= 5, "Affiliation rate max is 5%");
         saleInfo.affiliation = _enabled;
+        // Only update rate if enabling or rate is changing
+        if (_enabled || affiliateInfo.realTimeRewardPercentage != _rate) {
         affiliateInfo.realTimeRewardPercentage = _rate;
         affiliateInfo.maxReward=(saleInfo.hardCap*_rate)/100;
+    }
+     
+     emit AffiliateUpdated(_enabled, _rate);
 
     }
 
@@ -483,56 +546,23 @@ interface ITrendLock {
 
     function isSaleFilled() public view returns (bool) {
             return totalInvestedETH >= saleInfo.hardCap;
-        }
+    }
 
         /**
         * @notice Return how many unsold tokens remain
         */
-        function getUnsoldTokens() public view returns(uint256) {
+    function getUnsoldTokens() public view returns(uint256) {
             return saleInfo.presaleToken - tokensForDistribution;
-        }
-
-        function isAffiliation() external  view returns(bool){
-            return saleInfo.affiliation;
-        }
-
-        // --------------------------------------------------------------------------------
-        // Internal
-        // --------------------------------------------------------------------------------
-        function _processClaim(address _receiver) internal nonReentrant {
-            require(!isPoolCancelled, "Cancelled");
-            require(distributed, "Wait for Pool Finalize");
-            require(block.timestamp >= timestamps.claimTimestamp, "Claim not started");
-            require(totalInvestedETH >= saleInfo.softCap, "Soft cap not met");
-            UserInfo storage user = userInfo[_receiver];
-            uint256 amount = user.debt;
-            require(amount > 0, "No tokens to claim");
-            user.debt = 0;
-            user.claimed += amount;
-
-            distributedTokens += amount;
-
-            ERC20(saleInfo.rewardToken).safeTransfer(_receiver, amount);
-            emit TokensWithdrawn(_receiver, amount);
-        }
-
-    
-    function _handleAffiliate(address _sponsor, uint256 amount) internal {
-            if (_sponsor != address(0) && _sponsor != msg.sender) {
-                if (sponsorReferralSum[_sponsor] == 0) {
-                    sponeserAddress.push(_sponsor);
-                    affiliateInfo.poolRefCount++;
-                }
-                sponsorReferralSum[_sponsor] += amount;
-                uint256 reward = (affiliateInfo.realTimeRewardPercentage * amount) / 100;
-                sponserReward[_sponsor] += reward;
-                affiliateInfo.totalReferredAmount += amount;
-                affiliateInfo.currentReward += reward;
-            }
     }
 
-    function _getTokenAmount(uint256 ethAmount, uint256 price) internal   view returns (uint256) {
-            return (ethAmount * price ) / (10 ** tokenDecimals);
+    function isAffiliation() external  view returns(bool){
+            return saleInfo.affiliation;
+    }
+
+
+
+    function _getTokenAmount(uint256 ethAmount, uint256 price) internal  pure returns (uint256) {
+            return (ethAmount * price ) / (10 ** 18);
         }
 
     
@@ -551,11 +581,70 @@ interface ITrendLock {
     function getTotalParticipantCount() external view returns(uint256){
         return participants.length;
     }
+    
+    function isAllRefundCompleted() external view returns(bool){
+        return participants.length==totalRefundedCount;
+    }
 
+    function isDistributionCompleted() external view returns(bool){
+        return distributedTokens==tokensForDistribution;
+    }
+    
     function getClaimableTokenAmount(address _user) external view returns (uint256) { 
         UserInfo storage user = userInfo[_user];
-        return user.debt;
+        uint256 totalTokenAmount = user.debt;
+        if (totalTokenAmount == 0) {
+            return 0; // No tokens to claim
+        }
+          // If vesting is not enabled, check if already claimed
+         if (!saleInfo.isVestingEnabled || vestingInfo.startTime == 0) {
+             return user.claimed > 0 ? 0 : totalTokenAmount;
+         }
+
+        uint256 vestedAmount = getVestedAmount(totalTokenAmount);
+        if (vestedAmount <= user.claimed) {
+            return 0; // No new tokens available to claim
+        }
+        
+        return vestedAmount-user.claimed;
+        
     }
+
+    function getVestedAmount(uint256 _totalAmount) public view returns (uint256) {
+    // If vesting hasn't started yet, nothing is vested
+    if (block.timestamp < vestingInfo.startTime) {
+        return 0;
+    }
+    
+    // Calculate TGE portion
+    uint256 tgePortion = _totalAmount*(vestingInfo.TGEPercent)/(100);
+    uint256 vestedAmount = tgePortion;
+    
+    // Calculate additional vested amount based on cycles elapsed
+    uint256 timeSinceTGE = block.timestamp-vestingInfo.startTime;
+    
+    // Only calculate cycle-based vesting if necessary parameters are set
+    if (timeSinceTGE > 0 && vestingInfo.cycleTime > 0 && vestingInfo.releasePercent > 0) {
+        uint256 cyclesElapsed = timeSinceTGE/(vestingInfo.cycleTime);
+        
+        // Calculate amount vested per cycle
+        uint256 remainingAfterTGE = _totalAmount-(tgePortion);
+        uint256 cycleUnlockPerCycle = remainingAfterTGE*(vestingInfo.releasePercent)/(100);
+        
+        // Calculate total amount unlocked through cycles
+        uint256 totalCycleUnlock = cycleUnlockPerCycle*(cyclesElapsed);
+        
+        // Add cycle unlocks to TGE portion
+        vestedAmount = vestedAmount+(totalCycleUnlock);
+
+        // Cap at total allocation
+        if (vestedAmount > _totalAmount) {
+            vestedAmount = _totalAmount;
+        }
+    }
+
+    return vestedAmount;
+}
 
     function isPoolUser(address _user) external view returns ( bool){
         UserInfo storage user = userInfo[_user];
@@ -618,16 +707,92 @@ interface ITrendLock {
     function isPoolFinalize() external view  returns (bool){
         return distributed;
     }
-
-    function recoverWrongTokens(address _tokenAddress, uint256 _tokenForLp) external onlyOwner {
-            require(_tokenAddress != address(saleInfo.rewardToken), "Cannot recover sale token");
-            ERC20(_tokenAddress).safeTransfer(msg.sender, _tokenForLp);
-        }
-
     
-   
-    function recoverNativeTokens(uint256 tokenAmount) public onlyOwner {
-            payable(owner()).transfer(tokenAmount);
+    function isClaimTimeSet() external view returns (bool) {
+    return timestamps.claimTimestamp > 0;
+}
+
+function isSoftcapReached() public view returns (bool) {
+    return totalInvestedETH >= saleInfo.softCap;
+}
+
+
+function doesLiquidityExist(
+    address factory,
+    address tokenA,
+    address tokenB
+) public view returns (bool) {
+    address pair = IUniswapV2Factory(factory).getPair(tokenA, tokenB);
+    if (pair == address(0)) {
+        return false; // Pair does not exist
+    }
+    (uint112 reserve0, uint112 reserve1, ) = IUniswapV2Pair(pair).getReserves();
+    return reserve0 > 0 && reserve1 > 0;
+}
+
+
+        // --------------------------------------------------------------------------------
+        // Internal
+        // --------------------------------------------------------------------------------
+function _processClaim(address _receiver) internal nonReentrant {
+            require(!isPoolCancelled, "Cancelled");
+            require(distributed, "Wait for Pool Finalize");
+            require(timestamps.claimTimestamp > 0, "Claim time not set");
+            require(block.timestamp >= timestamps.claimTimestamp, "Claim not started");
+            require(totalInvestedETH >= saleInfo.softCap, "Soft cap not met");
+            UserInfo storage user = userInfo[_receiver];
+            uint256 totalTokenAmount = user.debt;
+            require(totalTokenAmount > 0, "No tokens to claim");
+            uint256 availableToClaimNow;
+            if (!saleInfo.isVestingEnabled || vestingInfo.startTime == 0) {
+                 require(user.claimed == 0, "Already claimed");
+                 // Claim full amount
+               availableToClaimNow = totalTokenAmount;
+               user.debt = 0;
+            }
+            else{
+               // Vesting is enabled - calculate available amount
+            uint256 vestedAmount = getVestedAmount(totalTokenAmount);
+            require(vestedAmount > 0, "No tokens vested yet");
+                     // Calculate unclaimed vested tokens
+            uint256 unclaimedVested = vestedAmount > user.claimed ?
+            vestedAmount-user.claimed : 0;
+        
+            require(unclaimedVested > 0, "No new tokens available to claim");
+        
+            availableToClaimNow = unclaimedVested;
+        
+        // If all tokens are claimed, clear the debt
+        if (vestedAmount >= totalTokenAmount) {
+            user.debt = 0;
         }
+}
+
+   // Update claimed amount
+    user.claimed = user.claimed+availableToClaimNow;
+    
+    // Update global tracking
+    distributedTokens = distributedTokens+availableToClaimNow;
+    
+    // Transfer tokens
+    ERC20(saleInfo.rewardToken).safeTransfer(_receiver, availableToClaimNow);
+    
+    emit TokensClaimed(_receiver, availableToClaimNow);
+        }
+
+    function _handleAffiliate(address _sponsor, uint256 amount) internal {
+            if (_sponsor != address(0) && _sponsor != msg.sender) {
+                if (sponsorReferralSum[_sponsor] == 0) {
+                    sponeserAddress.push(_sponsor);
+                    affiliateInfo.poolRefCount++;
+                }
+                sponsorReferralSum[_sponsor] += amount;
+                uint256 reward = (affiliateInfo.realTimeRewardPercentage * amount) / 100;
+                sponserReward[_sponsor] += reward;
+                affiliateInfo.totalReferredAmount += amount;
+                affiliateInfo.currentReward += reward;
+            }
+    }
+
 
     }

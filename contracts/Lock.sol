@@ -5,14 +5,14 @@ import "@openzeppelin/contracts/utils/Address.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 
-import "./ITrendLock.sol";
 import "./IUniswapV2Router02.sol";
 import "./IUniswapV2Pair.sol";
 import "./IUniswapV2Factory.sol";
 import "./FullMath.sol";
 
-contract TrendLock is ITrendLock {
+contract TrendLock is ReentrancyGuardUpgradeable {
     using Address for address payable;
     using EnumerableSet for EnumerableSet.AddressSet;
     using EnumerableSet for EnumerableSet.UintSet;
@@ -95,7 +95,7 @@ contract TrendLock is ITrendLock {
         uint256 amount,
         uint256 unlockDate,
         string memory description
-    ) external override returns (uint256 id) {
+    ) external  returns (uint256 id) {
         require(token != address(0), "Invalid token");
         require(amount > 0, "Amount should be greater than 0");
         require(
@@ -133,7 +133,7 @@ contract TrendLock is ITrendLock {
         uint256 cycle,
         uint256 cycleBps,
         string memory description
-    ) external override returns (uint256 id) {
+    ) external  returns (uint256 id) {
         require(token != address(0), "Invalid token");
         require(amount > 0, "Amount should be greater than 0");
         require(tgeDate > block.timestamp, "TGE date should be in the future");
@@ -163,94 +163,6 @@ contract TrendLock is ITrendLock {
         );
         emit LockAdded(id, token, owner, amount, tgeDate);
         return id;
-    }
-
-    function multipleVestingLock(
-        address[] calldata owners,
-        uint256[] calldata amounts,
-        address token,
-        bool isLpToken,
-        uint256 tgeDate,
-        uint256 tgeBps,
-        uint256 cycle,
-        uint256 cycleBps,
-        string memory description
-    ) external override returns (uint256[] memory) {
-        require(token != address(0), "Invalid token");
-        require(owners.length == amounts.length, "Length mismatched");
-        require(tgeDate > block.timestamp, "TGE date should be in the future");
-        require(cycle > 0, "Invalid cycle");
-        require(tgeBps > 0 && tgeBps < 10_000, "Invalid bips for TGE");
-        require(cycleBps > 0 && cycleBps < 10_000, "Invalid bips for cycle");
-        require(
-            tgeBps + cycleBps <= 10_000,
-            "Sum of TGE bps and cycle should be less than 10000"
-        );
-        return
-            _multipleVestingLock(
-                owners,
-                amounts,
-                token,
-                isLpToken,
-                [tgeDate, tgeBps, cycle, cycleBps],
-                description
-            );
-    }
-
-    function _multipleVestingLock(
-        address[] calldata owners,
-        uint256[] calldata amounts,
-        address token,
-        bool isLpToken,
-        uint256[4] memory vestingSettings, // avoid stack too deep
-        string memory description
-    ) internal returns (uint256[] memory) {
-        require(token != address(0), "Invalid token");
-        uint256 sumAmount = _sumAmount(amounts);
-        uint256 count = owners.length;
-        uint256[] memory ids = new uint256[](count);
-        for (uint256 i = 0; i < count; i++) {
-            ids[i] = _createLock(
-                owners[i],
-                token,
-                isLpToken,
-                amounts[i],
-                vestingSettings[0], // TGE date
-                vestingSettings[1], // TGE bps
-                vestingSettings[2], // cycle
-                vestingSettings[3], // cycle bps
-                description
-            );
-            emit LockAdded(
-                ids[i],
-                token,
-                owners[i],
-                amounts[i],
-                vestingSettings[0] // TGE date
-            );
-        }
-        _safeTransferFromEnsureExactAmount(
-            token,
-            msg.sender,
-            address(this),
-            sumAmount
-        );
-        return ids;
-    }
-
-    function _sumAmount(uint256[] calldata amounts)
-        internal
-        pure
-        returns (uint256)
-    {
-        uint256 sum = 0;
-        for (uint256 i = 0; i < amounts.length; i++) {
-            if (amounts[i] == 0) {
-                revert("Amount cant be zero");
-            }
-            sum += amounts[i];
-        }
-        return sum;
     }
 
     function _createLock(
@@ -386,7 +298,7 @@ contract TrendLock is ITrendLock {
         _locks.push(newLock);
     }
 
-    function unlock(uint256 lockId) external override validLock(lockId) {
+    function unlock(uint256 lockId) external  validLock(lockId) nonReentrant  {
         Lock storage userLock = _locks[_getActualIndex(lockId)];
         require(
             userLock.owner == msg.sender,
@@ -554,7 +466,7 @@ contract TrendLock is ITrendLock {
         uint256 lockId,
         uint256 newAmount,
         uint256 newUnlockDate
-    ) external override validLock(lockId) {
+    ) external  validLock(lockId) {
         Lock storage userLock = _locks[_getActualIndex(lockId)];
         require(
             userLock.owner == msg.sender,
@@ -664,7 +576,7 @@ contract TrendLock is ITrendLock {
             "Not enough token was transfered"
         );
     }
-
+    
     function getTotalLockCount() external view returns (uint256) {
         // Returns total lock count, regardless of whether it has been unlocked or not
         return _locks.length;
